@@ -222,11 +222,17 @@ class GT(BaseModel):
                     combined_layer = SparseMultiHopMoE(
                         gcn_layer=residual_module,
                         in_feats=self.hidden_dim,
-                        out_feats=self.hidden_dim
+                        out_feats=self.hidden_dim,
+                        top_k=kwargs.get('moe_top_k', 2),
+                        noise_std=kwargs.get('moe_noise_std', 0.0),
+                        cn_top_m=kwargs.get('cn_top_m', 50),
+                        cn_semantic=kwargs.get('cn_semantic', 'shell_set'),
+                        router_dropout=kwargs.get('moe_router_dropout', 0.0),
+                        min_temperature=kwargs.get('moe_min_temperature', 1.0),
                     )
 
                     self.layers.append(combined_layer)
-                    self.moe_layers.append(combined_layer) 
+                    self.moe_layers.append(combined_layer)
 
                 else:
                     self.layers.append(residual_module)
@@ -267,11 +273,17 @@ class GAT(BaseModel):
                     combined_layer = SparseMultiHopMoE(
                         gcn_layer=residual_module,
                         in_feats=self.hidden_dim,
-                        out_feats=self.hidden_dim
+                        out_feats=self.hidden_dim,
+                        top_k=kwargs.get('moe_top_k', 2),
+                        noise_std=kwargs.get('moe_noise_std', 0.0),
+                        cn_top_m=kwargs.get('cn_top_m', 50),
+                        cn_semantic=kwargs.get('cn_semantic', 'shell_set'),
+                        router_dropout=kwargs.get('moe_router_dropout', 0.0),
+                        min_temperature=kwargs.get('moe_min_temperature', 1.0),
                     )
 
                     self.layers.append(combined_layer)
-                    self.moe_layers.append(combined_layer) 
+                    self.moe_layers.append(combined_layer)
                 else:
                     self.layers.append(residual_module)
 

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import dgl
 from dgl import function as fn
 from dgl.utils import expand_as_pair, dgl_warning
-from model.ncn_modules import SparseMultiHopMoE
+from models.ncn_modules import SparseMultiHopMoE
 
 
 # ============================================================

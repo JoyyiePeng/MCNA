@@ -14,12 +14,11 @@ import copy
 import numpy as np
 from typing import Literal
 from functools import lru_cache
-import torch_scatter
 import tqdm
 import numba as nb
 
 # Import NCN modules
-from .ncn_modules import SparseMultiHopMoE
+from .ncn_modules import SparseMultiHopMoE, GatedFusion
 
 class MoEMixin:
     """通用 MoE 支持，任何模型都可以通过继承使用"""
@@ -187,19 +186,48 @@ def calculate_theta(d):
     return thetas
 
 
-class BWGNN(nn.Module):
+class BWGNN(MoEMixin, nn.Module):
     def __init__(self, in_feats, h_feats=32, num_classes=2, num_layers=2, mlp_layers=2, dropout_rate=0,
-                 activation='ReLU', **kwargs):
+                 activation='ReLU', use_ncn=True,
+                 min_gcn_weight=0.1, max_gcn_weight=1.0, gcn_init_weight=0.5,
+                 gate_dropout=0.3, **kwargs):
         super(BWGNN, self).__init__()
+        self.use_ncn = use_ncn
         self.thetas = calculate_theta(d=num_layers)
         self.conv = []
         for i in range(len(self.thetas)):
             self.conv.append(PolyConv(self.thetas[i]))
         self.linear = nn.Linear(in_feats, h_feats)
         self.linear2 = nn.Linear(h_feats, h_feats)
-        self.mlp = MLP(h_feats*len(self.conv), h_feats, num_classes, mlp_layers, dropout_rate)
         self.act = getattr(nn, activation)()
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+        if use_ncn:
+            # 投影层：将 PolyConv 拼接输出投影到 h_feats
+            self.bwgnn_proj = nn.Linear(h_feats * len(self.conv), h_feats)
+            # MCNA 并行分支，BWGNN 输出作为 main_out
+            self.mcna = SparseMultiHopMoE(
+                gcn_layer=nn.Identity(),
+                in_feats=h_feats,
+                out_feats=h_feats,
+                num_hops=3,
+                top_k=kwargs.get('moe_top_k', 1),
+                noise_std=kwargs.get('moe_noise_std', 0.0),
+                cn_top_m=kwargs.get('cn_top_m', 50),
+                cn_semantic=kwargs.get('cn_semantic', 'shell_set'),
+                router_dropout=kwargs.get('moe_router_dropout', 0.0),
+                min_temperature=kwargs.get('moe_min_temperature', 1.0),
+            )
+            # 用自定义参数替换默认的 GatedFusion
+            self.mcna.fusion = GatedFusion(
+                h_feats, dropout=gate_dropout,
+                min_gcn_weight=min_gcn_weight,
+                max_gcn_weight=max_gcn_weight,
+                gcn_init_weight=gcn_init_weight,
+            )
+            self.mlp = MLP(h_feats, h_feats, num_classes, mlp_layers, dropout_rate)
+        else:
+            self.mlp = MLP(h_feats * len(self.conv), h_feats, num_classes, mlp_layers, dropout_rate)
 
     def forward(self, graph):
         in_feat = graph.ndata['feature']
@@ -213,7 +241,13 @@ class BWGNN(nn.Module):
             h0 = conv(graph, h)
             h_final = torch.cat([h_final, h0], -1)
         h_final = self.dropout(h_final)
-        h = self.mlp(h_final, False)
+
+        if self.use_ncn:
+            h_bwgnn = self.bwgnn_proj(h_final)
+            h_fused = self.mcna(graph, h, main_out=h_bwgnn)
+            h = self.mlp(h_fused, False)
+        else:
+            h = self.mlp(h_final, False)
         return h
 
 
@@ -256,7 +290,11 @@ class GCN(MoEMixin, nn.Module):  # 继承 MoEMixin
         super().__init__()
         self.h_feats = h_feats
         self.use_ncn = use_ncn
-        self.ncn_layer_idx = ncn_layer_idx
+        # Clamp ncn_layer_idx to a valid layer so single-layer GCN still
+        # attaches the MCNA branch (otherwise the branch is silently dropped
+        # whenever num_layers <= ncn_layer_idx).
+        self.ncn_layer_idx = min(ncn_layer_idx, max(num_layers - 1, 0))
+        ncn_layer_idx = self.ncn_layer_idx
         self.layers = nn.ModuleList()
         self.act = getattr(nn, activation)()
         
@@ -272,13 +310,18 @@ class GCN(MoEMixin, nn.Module):  # 继承 MoEMixin
                     in_feats=input_dim,
                     out_feats=h_feats,
                     num_hops=3,      # 1-hop, 2-hop, 3-hop
-                    top_k=1,         # 每个节点只选1个增益专家
+                    top_k=kwargs.get('moe_top_k', 2),
+                    noise_std=kwargs.get('moe_noise_std', 0.0),
+                    cn_top_m=kwargs.get('cn_top_m', 50),
+                    cn_semantic=kwargs.get('cn_semantic', 'shell_set'),
+                    router_dropout=kwargs.get('moe_router_dropout', 0.0),
+                    min_temperature=kwargs.get('moe_min_temperature', 1.0),
                 )
 
                 self.layers.append(combined_layer)
             else:
                 self.layers.append(dglnn.GraphConv(input_dim, h_feats, activation=self.act))
-        
+
         self.mlp = MLP(h_feats, h_feats, num_classes, mlp_layers, dropout_rate)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
@@ -529,7 +572,10 @@ class GraphSAGE(nn.Module):
         super(GraphSAGE, self).__init__()
         self.layers = nn.ModuleList()
         self.use_ncn = use_ncn
-        self.ncn_layer_idx = ncn_layer_idx
+        # Clamp ncn_layer_idx to a valid layer; original code used (ncn_layer_idx-1)
+        # so the layer-1 idx must be at least 0 and at most num_layers-2
+        self.ncn_layer_idx = max(min(ncn_layer_idx, num_layers - 1), 1)
+        ncn_layer_idx = self.ncn_layer_idx
         self.act = getattr(nn, activation)()
         self.layers.append(dglnn.SAGEConv(in_feats, h_feats, agg, activation=self.act))
         self.moe_layers = []
@@ -540,7 +586,12 @@ class GraphSAGE(nn.Module):
                     in_feats=h_feats,
                     out_feats=h_feats,
                     num_hops=3,      # 1-hop, 2-hop, 3-hop
-                    top_k=1,         # 每个节点只选1个增益专家
+                    top_k=kwargs.get('moe_top_k', 1),
+                    noise_std=kwargs.get('moe_noise_std', 0.0),
+                    cn_top_m=kwargs.get('cn_top_m', 50),
+                    cn_semantic=kwargs.get('cn_semantic', 'shell_set'),
+                    router_dropout=kwargs.get('moe_router_dropout', 0.0),
+                    min_temperature=kwargs.get('moe_min_temperature', 1.0),
                 )
 
                 self.layers.append(combined_layer)

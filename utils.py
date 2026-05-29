@@ -9,6 +9,9 @@ import torch
 
 class Dataset:
     def __init__(self, name='tfinance', prefix='datasets/'):
+        graph = load_graphs(prefix + name)[0][0]
+        if graph.idtype == torch.int32:
+            graph = graph.long()
         self.name = name
         self.graph = graph
 
@@ -82,6 +85,9 @@ model_detector_dict = {
     'MySAGEPool': BaseGNNDetector,
     'MySAGELSTM': BaseGNNDetector,
     'MySAGEGCN': BaseGNNDetector,
+
+    # Adaptive Message Passing
+    'GADAM': GADAMDetector,
 }
 
 
@@ -343,12 +349,17 @@ param_space['AMNet'] = {
 }
 
 param_space['BWGNN'] = {
-    'h_feats': [16, 32, 64],
-    'drop_rate': [0, 0.1, 0.2, 0.3],
-    'num_layers': [1, 2, 3, 4],
-    'lr': 10 ** np.linspace(-3, -1, 1000),
-    'mlp_layers': [1, 2],
-    'activation': ['ReLU', 'LeakyReLU', 'Tanh'],
+    # Fixed original params (defaults)
+    'h_feats': [32],
+    'num_layers': [2],
+    'lr': [0.01],
+    'mlp_layers': [2],
+    'activation': ['ReLU'],
+    # Only search GatedFusion params
+    'min_gcn_weight': [0.1, 0.2, 0.3, 0.5],
+    'max_gcn_weight': [0.7, 0.8, 0.9, 1.0],
+    'gcn_init_weight': [0.3, 0.5, 0.7, 0.9],
+    'gate_dropout': [0.1, 0.2, 0.3, 0.5],
 }
 
 param_space['GAS'] = {

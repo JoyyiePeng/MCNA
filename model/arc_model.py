@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import random
 import numpy as np
 import scipy.sparse as sp
-from model.ncn_modules import SparseMultiHopMoE
+from models.ncn_modules import SparseMultiHopMoE
 
 
 # ============================================================

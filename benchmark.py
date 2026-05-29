@@ -26,6 +26,30 @@ parser.add_argument('--inductive', type=int, default=0)
 parser.add_argument('--models', type=str, default=None)
 parser.add_argument('--datasets', type=str, default=None)
 parser.add_argument('--better_output', choices=['True', 'False'], default='True')
+parser.add_argument('--no_mcna', action='store_true',
+                    help='Disable the MCNA branch (use the bare backbone only)')
+parser.add_argument('--lr', type=float, default=0.01,
+                    help='Learning rate (paper: tuned from {1e-4, 5e-4, 1e-3, 5e-3})')
+parser.add_argument('--weight_decay', type=float, default=0.0,
+                    help='Adam weight decay (paper: tuned from {1e-5, 1e-4, 1e-3})')
+parser.add_argument('--epochs', type=int, default=10000,
+                    help='Max training epochs (random_search.py uses 100)')
+parser.add_argument('--patience', type=int, default=100,
+                    help='Early-stopping patience (random_search.py uses 20)')
+parser.add_argument('--cn_top_m', type=int, default=50,
+                    help='Top-M truncation for the CN computation (default 50)')
+parser.add_argument('--cn_semantic', type=str, default='shell_set',
+                    choices=['shell_set', 'shell_walk'],
+                    help='shell_set = |N^k(i) cap N^k(j)|; '
+                         'shell_walk = walk-count A^k masked to k-hop shell')
+parser.add_argument('--moe_top_k', type=int, default=2,
+                    help='Number of hops each node activates in the MoE')
+parser.add_argument('--moe_noise', type=float, default=0.0,
+                    help='Gaussian noise added to router logits during training')
+parser.add_argument('--moe_min_temp', type=float, default=1.0,
+                    help='Minimum router temperature (smooths logits)')
+parser.add_argument('--moe_router_dropout', type=float, default=0.0,
+                    help='Dropout applied on router_probs during training')
 args = parser.parse_args()
 
 better_result = args.better_output == 'True'
@@ -66,13 +90,25 @@ for model in models:
         time_cost = 0
         train_config = {
             'device': 'cuda',
-            'epochs': 10000,
-            'patience': 100,
+            'epochs': args.epochs,
+            'patience': args.patience,
             'metric': 'AUROC',
             'inductive': bool(args.inductive)
         }
         data = Dataset(dataset_name)
-        model_config = {'model': model, 'lr': 0.01, 'drop_rate': 0}
+        model_config = {'model': model, 'lr': args.lr, 'drop_rate': 0,
+                        'weight_decay': args.weight_decay,
+                        'cn_top_m': args.cn_top_m,
+                        'cn_semantic': args.cn_semantic,
+                        'moe_top_k': args.moe_top_k,
+                        'moe_noise_std': args.moe_noise,
+                        'moe_min_temperature': args.moe_min_temp,
+                        'moe_router_dropout': args.moe_router_dropout}
+        if args.no_mcna:
+            model_config['use_ncn'] = False
+            model_config['use_multihop'] = False
+            model_config['use_multihop_moe'] = False
+            model_config['use_moe'] = False
         if dataset_name == 'tsocial':
             model_config['h_feats'] = 16
             # if model in ['GHRN', 'KNNGCN', 'AMNet', 'GT', 'GAT', 'GATv2', 'GATSep', 'PNA']:   # require more than 24G GPU memory

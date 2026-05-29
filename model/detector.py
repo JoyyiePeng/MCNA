@@ -3,6 +3,7 @@ from models.attention import *
 from models.spacegnn import SpaceGNNOriginal
 from models.dgagnn import DGA
 from models.arc_model import ARC, normalize_adj, sparse_mx_to_torch_sparse_tensor
+from models.gadam import LocalModel, GlobalModel
 from sklearn import svm
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -72,12 +73,16 @@ class BaseGNNDetector(BaseDetector):
         self.model = gnn(**model_config).to(train_config['device'])
 
     def train(self):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.model_config['lr'])
+        optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.model_config['lr'],
+            weight_decay=self.model_config.get('weight_decay', 0.0),
+        )
         train_labels, val_labels, test_labels = self.labels[self.train_mask], self.labels[self.val_mask], self.labels[self.test_mask]
-        final_epoch = 0  
-        best_expert_stats = None  
+        final_epoch = 0
+        best_expert_stats = None
         for e in range(self.train_config['epochs']):
-            
+
             self.model.train()
             logits = self.model(self.train_graph)
             main_loss = F.cross_entropy(logits[self.train_graph.ndata['train_mask']], train_labels,
@@ -2778,3 +2783,128 @@ class ARCDetector(BaseDetector):
 
 
 
+
+# ============================================================
+# GADAM Detector
+# ============================================================
+
+class GADAMDetector(BaseDetector):
+    """
+    GADAM: Boosting Graph Anomaly Detection with Adaptive Message Passing
+    Two-stage detector: LocalModel (LIM) -> GlobalModel (adaptive message passing)
+    """
+    def __init__(self, train_config, model_config, data):
+        super().__init__(train_config, model_config, data)
+        self.out_dim = model_config.get('h_feats', 64)
+        self.local_epochs = model_config.get('local_epochs', 100)
+        self.global_epochs = model_config.get('global_epochs', 50)
+        self.local_lr = model_config.get('local_lr', 1e-3)
+        self.global_lr = model_config.get('global_lr', 5e-4)
+        self.ano_topk = model_config.get('ano_topk', 0.05)
+        self.nor_topk = model_config.get('nor_topk', 0.3)
+
+    def train(self):
+        device = self.train_config['device']
+        graph = self.source_graph.to(device)
+        feats = graph.ndata['feature'].float().to(device)
+        in_feats = feats.shape[1]
+        labels = self.labels.cpu().numpy()
+        train_labels = self.labels[self.train_mask]
+        val_labels = self.labels[self.val_mask]
+        test_labels = self.labels[self.test_mask]
+
+        # ===== Stage 1: Local Model (LIM) =====
+        local_net = LocalModel(graph, in_feats, self.out_dim, nn.PReLU()).to(device)
+        local_opt = torch.optim.Adam(local_net.parameters(), lr=self.local_lr)
+
+        def init_xavier(m):
+            if type(m) == nn.Linear:
+                nn.init.xavier_normal_(m.weight)
+
+        local_net.apply(init_xavier)
+
+        best_local_loss = float('inf')
+        best_local_state = None
+
+        for e in range(self.local_epochs):
+            local_net.train()
+            local_opt.zero_grad()
+            loss, l1, l2 = local_net(feats)
+            loss.backward()
+            local_opt.step()
+
+            if loss.item() < best_local_loss:
+                best_local_loss = loss.item()
+                best_local_state = {k: v.clone() for k, v in local_net.state_dict().items()}
+
+            if e % 20 == 0:
+                print(f"[GADAM Local] Epoch {e}, Loss {loss.item():.4f}")
+
+        # Restore best local model
+        local_net.load_state_dict(best_local_state)
+        local_net.eval()
+
+        with torch.no_grad():
+            h, mean_h = local_net.encoder(feats)
+            pos = graph.ndata['pos']
+
+        # ===== Select high-confidence normal/anomaly nodes =====
+        scores_local = -pos.detach()
+        num_nodes = graph.num_nodes()
+
+        num_ano = int(num_nodes * self.ano_topk)
+        _, ano_idx = torch.topk(scores_local, num_ano)
+
+        num_nor = int(num_nodes * self.nor_topk)
+        _, nor_idx = torch.topk(-scores_local, num_nor)
+
+        center = h[nor_idx].mean(dim=0).detach()
+
+        # ===== Stage 2: Global Model (Adaptive Message Passing) =====
+        global_net = GlobalModel(
+            graph, in_feats, self.out_dim, nn.PReLU(),
+            nor_idx, ano_idx, center
+        ).to(device)
+        global_opt = torch.optim.Adam(global_net.parameters(), lr=self.global_lr)
+        global_net.apply(init_xavier)
+
+        best_val_score = -1
+        test_score = None
+
+        for e in range(self.global_epochs):
+            global_net.train()
+            global_opt.zero_grad()
+            loss, scores = global_net(feats, e)
+            loss.backward()
+            global_opt.step()
+
+            # Compute mixed anomaly score
+            with torch.no_grad():
+                mix_score = -(scores + pos).detach()
+                probs = mix_score
+
+                # Normalize to [0, 1] for evaluation
+                probs_normalized = (probs - probs.min()) / (probs.max() - probs.min() + 1e-8)
+
+                val_score = self.eval(val_labels, probs_normalized[self.val_mask])
+
+                if val_score[self.train_config['metric']] > best_val_score:
+                    self.patience_knt = 0
+                    best_val_score = val_score[self.train_config['metric']]
+                    test_score = self.eval(test_labels, probs_normalized[self.test_mask])
+
+                    if e % 10 == 0:
+                        print(f"[GADAM Global] Epoch {e}, Loss {loss.item():.4f}, "
+                              f"Val AUC {val_score['AUROC']:.4f}, Test AUC {test_score['AUROC']:.4f}")
+                else:
+                    self.patience_knt += 1
+                    if self.patience_knt > self.train_config['patience']:
+                        break
+
+        if test_score is None:
+            with torch.no_grad():
+                mix_score = -(scores + pos).detach()
+                probs_normalized = (mix_score - mix_score.min()) / (mix_score.max() - mix_score.min() + 1e-8)
+                test_score = self.eval(test_labels, probs_normalized[self.test_mask])
+
+        return test_score
